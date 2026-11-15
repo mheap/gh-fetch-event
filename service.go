@@ -21,7 +21,7 @@ type service struct {
 	client       ghClient
 	stderr       io.Writer
 	explain      bool
-	fetchMissing bool
+	skipMissing  bool
 	skipArtifact bool
 	skipEvent    bool
 	skipAPI      bool
@@ -48,7 +48,12 @@ type runPullRef struct {
 }
 
 type runActor struct {
-	Login string `json:"login"`
+	ID        int64  `json:"id,omitempty"`
+	Login     string `json:"login,omitempty"`
+	AvatarURL string `json:"avatar_url,omitempty"`
+	Gravatar  string `json:"gravatar_id,omitempty"`
+	URL       string `json:"url,omitempty"`
+	HTMLURL   string `json:"html_url,omitempty"`
 }
 
 type artifactList struct {
@@ -122,7 +127,14 @@ func (s service) fetch(runID int64, selected selector) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("convert matching PushEvent payload: %w", err)
 			}
-			s.reportPushEventMatch(matched.ID)
+			var added []string
+			if !s.skipMissing && !s.skipAPI {
+				payload, added, err = s.augmentPushPayload(payload, matched.Actor, false)
+				if err != nil {
+					return "", err
+				}
+			}
+			s.reportPushEventMatch(matched.ID, added)
 			return prettyJSON(payload)
 		}
 		var eventPayload map[string]json.RawMessage
@@ -130,7 +142,7 @@ func (s service) fetch(runID int64, selected selector) (string, error) {
 			return "", fmt.Errorf("decode matching Events API payload: %w", err)
 		}
 		var addedFields []string
-		if s.fetchMissing {
+		if !s.skipMissing && !s.skipAPI {
 			var view payloadView
 			if err := json.Unmarshal(matched.Payload, &view); err != nil {
 				return "", fmt.Errorf("decode matching pull request event: %w", err)
@@ -152,6 +164,20 @@ func (s service) fetch(runID int64, selected selector) (string, error) {
 				return "", fmt.Errorf("merge pull request fields: %w", err)
 			}
 			eventPayload["pull_request"] = updatedPR
+			if _, exists := eventPayload["repository"]; !exists {
+				repository, err := s.getRepository()
+				if err != nil {
+					return "", fmt.Errorf("fetch current repository fields: %w", err)
+				}
+				eventPayload["repository"] = repository
+				addedFields = append(addedFields, "repository")
+			}
+			if _, exists := eventPayload["sender"]; !exists {
+				if sender := webhookSender(matched.Actor); len(sender) > 0 {
+					eventPayload["sender"] = sender
+					addedFields = append(addedFields, "sender")
+				}
+			}
 		}
 		result, err := json.Marshal(eventPayload)
 		if err != nil {
@@ -410,6 +436,214 @@ func pushWebhookPayload(eventPayload json.RawMessage) ([]byte, error) {
 	return json.Marshal(map[string]string{"ref": event.Ref, "after": event.Head, "before": event.Before})
 }
 
+type compareResponse struct {
+	Status       string          `json:"status"`
+	HTMLURL      string          `json:"html_url"`
+	TotalCommits int             `json:"total_commits"`
+	Commits      []compareCommit `json:"commits"`
+}
+
+type compareCommit struct {
+	SHA     string `json:"sha"`
+	HTMLURL string `json:"html_url"`
+	Commit  struct {
+		Author struct {
+			Name  string `json:"name"`
+			Email string `json:"email"`
+			Date  string `json:"date"`
+		} `json:"author"`
+		Committer struct {
+			Name  string `json:"name"`
+			Email string `json:"email"`
+			Date  string `json:"date"`
+		} `json:"committer"`
+		Message string `json:"message"`
+		Tree    struct {
+			SHA string `json:"sha"`
+		} `json:"tree"`
+	} `json:"commit"`
+	Author *struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	Committer *struct {
+		Login string `json:"login"`
+	} `json:"committer"`
+}
+
+func (s service) augmentPushPayload(data []byte, actor runActor, beforeAssumed bool) ([]byte, []string, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, nil, fmt.Errorf("decode push event before augmentation: %w", err)
+	}
+	var ref, before, after string
+	_ = json.Unmarshal(payload["ref"], &ref)
+	_ = json.Unmarshal(payload["before"], &before)
+	_ = json.Unmarshal(payload["after"], &after)
+	var added []string
+	setIfMissing := func(key string, value any) error {
+		if _, exists := payload[key]; exists {
+			return nil
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		payload[key] = encoded
+		added = append(added, key)
+		return nil
+	}
+
+	if _, exists := payload["repository"]; !exists {
+		repository, err := s.getRepository()
+		if err != nil {
+			fmt.Fprintf(s.stderr, "Warning: could not fetch current repository fields for push event: %v\n", err)
+		} else {
+			payload["repository"] = repository
+			added = append(added, "repository")
+		}
+	}
+	if _, exists := payload["sender"]; !exists {
+		if sender := webhookSender(actor); len(sender) > 0 {
+			payload["sender"] = sender
+			added = append(added, "sender")
+		}
+	}
+	if _, exists := payload["pusher"]; !exists && actor.Login != "" {
+		if err := setIfMissing("pusher", map[string]string{"name": actor.Login}); err != nil {
+			return nil, nil, fmt.Errorf("encode push pusher: %w", err)
+		}
+	}
+	if _, exists := payload["base_ref"]; !exists {
+		if err := setIfMissing("base_ref", nil); err != nil {
+			return nil, nil, fmt.Errorf("encode push base_ref: %w", err)
+		}
+	}
+	if before != "" {
+		if err := setIfMissing("created", isZeroSHA(before)); err != nil {
+			return nil, nil, fmt.Errorf("encode push created flag: %w", err)
+		}
+	}
+	if after != "" {
+		if err := setIfMissing("deleted", isZeroSHA(after)); err != nil {
+			return nil, nil, fmt.Errorf("encode push deleted flag: %w", err)
+		}
+	}
+
+	if before != "" && after != "" && !isZeroSHA(before) && !isZeroSHA(after) {
+		var comparison compareResponse
+		if err := s.getJSON(comparePath(s.client.repo, before, after), &comparison); err != nil {
+			fmt.Fprintf(s.stderr, "Warning: could not compare push commits %s...%s: %v\n", before, after, err)
+		} else {
+			if comparison.HTMLURL != "" {
+				if err := setIfMissing("compare", comparison.HTMLURL); err != nil {
+					return nil, nil, fmt.Errorf("encode push compare URL: %w", err)
+				}
+			}
+			if comparison.Status == "ahead" || comparison.Status == "identical" {
+				if err := setIfMissing("forced", false); err != nil {
+					return nil, nil, fmt.Errorf("encode push forced flag: %w", err)
+				}
+			} else if comparison.Status == "behind" || comparison.Status == "diverged" {
+				if err := setIfMissing("forced", true); err != nil {
+					return nil, nil, fmt.Errorf("encode push forced flag: %w", err)
+				}
+			}
+			if _, exists := payload["commits"]; !exists {
+				commits := make([]json.RawMessage, 0, len(comparison.Commits))
+				for _, commit := range comparison.Commits {
+					mapped, err := commit.webhookPayload()
+					if err != nil {
+						return nil, nil, err
+					}
+					commits = append(commits, mapped)
+				}
+				encoded, err := json.Marshal(commits)
+				if err != nil {
+					return nil, nil, fmt.Errorf("encode push commits: %w", err)
+				}
+				payload["commits"] = encoded
+				added = append(added, "commits")
+				if len(comparison.Commits) > 0 {
+					payload["head_commit"] = commits[len(commits)-1]
+					added = append(added, "head_commit")
+				} else {
+					payload["head_commit"] = json.RawMessage("null")
+					added = append(added, "head_commit")
+				}
+				if comparison.TotalCommits > len(comparison.Commits) {
+					fmt.Fprintf(s.stderr, "Warning: compare API returned %d of %d commits; push.commits is incomplete.\n", len(comparison.Commits), comparison.TotalCommits)
+				}
+			}
+		}
+	}
+
+	if beforeAssumed && len(added) > 0 {
+		fmt.Fprintln(s.stderr, "Warning: push details from the compare API depend on the inferred before SHA and may be inaccurate if that SHA was not the previous ref tip.")
+	}
+	if actor.Login != "" {
+		fmt.Fprintln(s.stderr, "Warning: sender and pusher.name use the workflow run actor as an assumption; reruns may have a different actor from the original push. pusher.email is unavailable.")
+	}
+	if len(added) > 0 {
+		fmt.Fprintf(s.stderr, "Added push fields from current API data and run metadata: %s.\n", strings.Join(added, ", "))
+	}
+	result, err := json.Marshal(payload)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode augmented push event: %w", err)
+	}
+	return result, added, nil
+}
+
+func (c compareCommit) webhookPayload() (json.RawMessage, error) {
+	person := func(name, email, username string) map[string]string {
+		result := make(map[string]string)
+		if name != "" {
+			result["name"] = name
+		}
+		if email != "" {
+			result["email"] = email
+		}
+		if username != "" {
+			result["username"] = username
+		}
+		return result
+	}
+	message := c.Commit.Committer.Date
+	if message == "" {
+		message = c.Commit.Author.Date
+	}
+	result := map[string]any{
+		"id":        c.SHA,
+		"tree_id":   c.Commit.Tree.SHA,
+		"message":   c.Commit.Message,
+		"timestamp": message,
+		"url":       c.HTMLURL,
+		"author":    person(c.Commit.Author.Name, c.Commit.Author.Email, loginOf(c.Author)),
+		"committer": person(c.Commit.Committer.Name, c.Commit.Committer.Email, loginOf(c.Committer)),
+	}
+	return json.Marshal(result)
+}
+
+func loginOf(user *struct {
+	Login string `json:"login"`
+}) string {
+	if user == nil {
+		return ""
+	}
+	return user.Login
+}
+
+func isZeroSHA(sha string) bool {
+	if sha == "" {
+		return false
+	}
+	for _, char := range sha {
+		if char != '0' {
+			return false
+		}
+	}
+	return true
+}
+
 func (s service) reconstructPush(run workflowRun, eventState string) (string, error) {
 	if run.HeadSHA == "" || run.HeadBranch == "" {
 		return "", errors.New("cannot reconstruct push event: workflow run is missing head_sha or head_branch")
@@ -422,22 +656,24 @@ func (s service) reconstructPush(run workflowRun, eventState string) (string, er
 	}
 	payload := map[string]json.RawMessage{"ref": mustJSON(ref), "after": mustJSON(run.HeadSHA)}
 	var before string
-	var commit struct {
-		Parents []struct {
-			SHA string `json:"sha"`
-		} `json:"parents"`
-	}
-	if err := s.getJSON(commitPath(s.client.repo, run.HeadSHA), &commit); err != nil {
-		fmt.Fprintf(s.stderr, "Warning: could not inspect head commit parents for a likely before SHA: %v\n", err)
-	} else if len(commit.Parents) > 0 && commit.Parents[0].SHA != "" {
-		before = commit.Parents[0].SHA
-		payload["before"] = mustJSON(before)
+	if !s.skipMissing {
+		var commit struct {
+			Parents []struct {
+				SHA string `json:"sha"`
+			} `json:"parents"`
+		}
+		if err := s.getJSON(commitPath(s.client.repo, run.HeadSHA), &commit); err != nil {
+			fmt.Fprintf(s.stderr, "Warning: could not inspect head commit parents for a likely before SHA: %v\n", err)
+		} else if len(commit.Parents) > 0 && commit.Parents[0].SHA != "" {
+			before = commit.Parents[0].SHA
+			payload["before"] = mustJSON(before)
+		}
 	}
 	reason := "no unique historical PushEvent matched the run metadata"
 	if eventState == "ambiguous" {
 		reason = "multiple historical PushEvent records matched the run metadata"
 	}
-	fmt.Fprintf(s.stderr, "Warning: %s; reconstructed a sparse push event from workflow run metadata. The commit list and full webhook context are unavailable.\n", reason)
+	fmt.Fprintf(s.stderr, "Warning: %s; reconstructed a push event from workflow run metadata.\n", reason)
 	if before != "" {
 		fmt.Fprintln(s.stderr, "Warning: inferred before from the first parent of after, assuming it was the ref tip before a single-commit push. This may be wrong when multiple commits were pushed or history was rewritten.")
 	} else {
@@ -446,16 +682,23 @@ func (s service) reconstructPush(run workflowRun, eventState string) (string, er
 	if assumedRef {
 		fmt.Fprintln(s.stderr, "Warning: interpreted head_branch as a branch name and prefixed refs/heads/; the workflow run metadata does not identify branch versus tag here.")
 	}
-	if s.fetchMissing {
-		fmt.Fprintln(s.stderr, "Warning: --fetch-missing-fields applies only to pull_request event fields; no push fields were fetched.")
-	}
-	if s.explain {
-		fmt.Fprintln(s.stderr, "Source: Current + Assumed.")
-		fmt.Fprintln(s.stderr, "Provenance: after <- workflow run head_sha; ref <- workflow run head_branch (refs/heads/ prefix assumed when absent); before <- first parent of after when available (assumed to be the prior ref tip for a single-commit push). commits are omitted because they cannot be recovered reliably from run metadata.")
-	}
 	result, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("encode reconstructed push event: %w", err)
+	}
+	if !s.skipMissing && !s.skipAPI {
+		var added []string
+		result, added, err = s.augmentPushPayload(result, run.Actor, true)
+		if err != nil {
+			return "", err
+		}
+		if s.explain {
+			fmt.Fprintf(s.stderr, "Push fields added from current API data or run metadata: %s.\n", strings.Join(added, ", "))
+		}
+	}
+	if s.explain {
+		fmt.Fprintln(s.stderr, "Source: Current + Assumed.")
+		fmt.Fprintln(s.stderr, "Provenance: after <- workflow run head_sha; ref <- workflow run head_branch (refs/heads/ prefix assumed when absent); before <- first parent of after when available (assumed to be the prior ref tip for a single-commit push); commits/repository <- current GitHub API data; sender/pusher.name <- workflow run actor when present (assumed); created/deleted/forced <- inferred; base_ref <- assumed null. Commit distinct flags and pusher.email are unavailable.")
 	}
 	return prettyJSON(result)
 }
@@ -600,6 +843,28 @@ func (s service) getPullRequest(number int64) (json.RawMessage, error) {
 	return json.RawMessage(data), nil
 }
 
+func (s service) getRepository() (json.RawMessage, error) {
+	data, err := s.client.api(repositoryPath(s.client.repo), maxJSONResponse)
+	if err != nil {
+		return nil, err
+	}
+	if !json.Valid(data) {
+		return nil, errors.New("GitHub returned invalid repository JSON")
+	}
+	return json.RawMessage(data), nil
+}
+
+func webhookSender(actor runActor) json.RawMessage {
+	if actor.Login == "" && actor.ID == 0 {
+		return nil
+	}
+	data, err := json.Marshal(actor)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
 func (s service) getJSON(path string, target any) error {
 	data, err := s.client.api(apiItemPath(path), maxJSONResponse)
 	if err != nil {
@@ -645,33 +910,47 @@ func (s service) reportArtifact(name string) {
 }
 
 func (s service) reportEventMatch(eventID string, added []string, selected selector) {
-	source := "Historical + Current"
+	source := "Historical"
+	if len(added) > 0 {
+		source = "Historical + Current"
+	}
 	fmt.Fprintf(s.stderr, "Source: %s (Events API record %s).\n", source, eventID)
 	fmt.Fprintln(s.stderr, "Warning: the event action and time are historical, but the embedded pull_request object may reflect current PR state.")
 	if s.explain {
-		fmt.Fprintln(s.stderr, "Provenance: action, number, and event time <- historical Events API record; pull_request.* <- embedded PR object, which GitHub may update over time.")
+		if s.skipAPI {
+			fmt.Fprintln(s.stderr, "Provenance: all payload fields <- historical Events API record; actor remains in the Events API envelope and was not copied into sender because API-state enrichment is disabled.")
+		} else {
+			fmt.Fprintln(s.stderr, "Provenance: action, number, and event time <- historical Events API record; embedded pull_request.* may reflect current PR state; missing pull_request.* <- current PR API response; repository <- current repository API response; sender <- actor on the historical Events API record.")
+		}
 		if selected.action == "labeled" {
 			fmt.Fprintln(s.stderr, "Provenance: label <- matching historical Events API record; the selector's label value filters candidates by label.name.")
 		}
 		if len(added) > 0 {
-			fmt.Fprintf(s.stderr, "Current PR fields added where absent: %s.\n", strings.Join(added, ", "))
-		} else if s.fetchMissing {
-			fmt.Fprintln(s.stderr, "No PR fields were missing from the historical event record.")
+			fmt.Fprintf(s.stderr, "Fields added where absent: %s.\n", strings.Join(added, ", "))
+		} else if !s.skipMissing {
+			fmt.Fprintln(s.stderr, "No fields were missing from the historical event record.")
 		}
 	}
 	if len(added) > 0 {
-		fmt.Fprintf(s.stderr, "Added current PR fields from the current pull request API response (%d fields).\n", len(added))
+		fmt.Fprintf(s.stderr, "Added missing webhook fields from current PR/repository data and the Events API actor (%d fields).\n", len(added))
 	}
 }
 
-func (s service) reportPushEventMatch(eventID string) {
-	fmt.Fprintf(s.stderr, "Source: Historical (Events API PushEvent %s).\n", eventID)
-	fmt.Fprintln(s.stderr, "Warning: the Events API record provides ref, before, and after SHA only; commits and full webhook context are unavailable.")
-	if s.fetchMissing {
-		fmt.Fprintln(s.stderr, "Warning: --fetch-missing-fields applies only to pull_request event fields; no push fields were fetched.")
+func (s service) reportPushEventMatch(eventID string, added []string) {
+	source := "Historical"
+	if len(added) > 0 {
+		source = "Historical + Current"
+	}
+	fmt.Fprintf(s.stderr, "Source: %s (Events API PushEvent %s).\n", source, eventID)
+	fmt.Fprintln(s.stderr, "Warning: the Events API record provides ref, before, and after SHA only; other historical push fields may be unavailable.")
+	if len(added) > 0 {
+		fmt.Fprintf(s.stderr, "Added push fields from current API data and the Events API actor (%d fields).\n", len(added))
 	}
 	if s.explain {
-		fmt.Fprintln(s.stderr, "Provenance: ref and before <- historical PushEvent payload; after <- historical PushEvent head. The Events API payload was translated to webhook field names.")
+		fmt.Fprintln(s.stderr, "Provenance: ref and before <- historical PushEvent payload; after <- historical PushEvent head; repository/commits/compare <- current GitHub API data; sender <- historical Events API actor; pusher.name <- Events API actor (assumed); forced/created/deleted/base_ref may be inferred.")
+		if len(added) > 0 {
+			fmt.Fprintf(s.stderr, "Fields added where absent: %s. pusher.email and commit distinct flags cannot be recovered from the APIs used.\n", strings.Join(added, ", "))
+		}
 	}
 }
 

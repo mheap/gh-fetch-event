@@ -11,13 +11,13 @@ import (
 )
 
 type options struct {
-	runID        int64
-	event        string
-	repo         string
-	hostname     string
-	output       string
-	explain      bool
-	fetchMissing bool
+	runID       int64
+	event       string
+	repo        string
+	hostname    string
+	output      string
+	explain     bool
+	skipMissing bool
 }
 
 func main() {
@@ -50,7 +50,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		client:       client,
 		stderr:       stderr,
 		explain:      opts.explain,
-		fetchMissing: opts.fetchMissing,
+		skipMissing:  opts.skipMissing,
 		skipArtifact: envEnabled("GH_FETCH_EVENT_SKIP_ARTIFACT"),
 		skipEvent:    envEnabled("GH_FETCH_EVENT_SKIP_EVENT"),
 		skipAPI:      envEnabled("GH_FETCH_EVENT_SKIP_API"),
@@ -84,7 +84,7 @@ func parseOptions(args []string, stderr io.Writer) (options, bool, error) {
 	fs.StringVar(&opts.hostname, "hostname", "", "GitHub hostname (defaults to the current gh host)")
 	fs.StringVar(&opts.output, "output", "", "Write JSON to a file instead of stdout")
 	fs.BoolVar(&opts.explain, "explain", false, "Explain the payload source and field provenance on stderr")
-	fs.BoolVar(&opts.fetchMissing, "fetch-missing-fields", false, "Fill absent pull request fields from the current PR API response")
+	fs.BoolVar(&opts.skipMissing, "skip-missing-fields", false, "Do not fill missing webhook fields from current API data")
 
 	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
 		fs.Usage = func() {

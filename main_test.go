@@ -62,6 +62,10 @@ func TestParseOptionsRequiresSelector(t *testing.T) {
 	if err != nil || labeledHelp || labeledOpts.event != "pull_request.labelled=ready for review" {
 		t.Fatalf("parseOptions for labeled event = (%#v, %v, %v)", labeledOpts, labeledHelp, err)
 	}
+	skipOpts, skipHelp, err := parseOptions([]string{"789", "--event", "pull_request.opened", "--skip-missing-fields"}, &bytes.Buffer{})
+	if err != nil || skipHelp || !skipOpts.skipMissing {
+		t.Fatalf("parseOptions for skip-missing-fields = (%#v, %v, %v)", skipOpts, skipHelp, err)
+	}
 }
 
 func TestReorderFlags(t *testing.T) {
@@ -532,25 +536,34 @@ func TestFetchUsesRequiredSelectorActionWhenEventFeedHasNoMatch(t *testing.T) {
 func TestFetchUsesHistoricalPushEvent(t *testing.T) {
 	created := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
 	run := workflowRun{ID: 42, Event: "push", Status: "completed", CreatedAt: created, HeadSHA: "after-sha", HeadBranch: "main"}
-	event := githubEvent{ID: "push-record", Type: "PushEvent", CreatedAt: created.Add(-time.Minute), Payload: json.RawMessage(`{"repository_id":1,"push_id":2,"ref":"refs/heads/main","head":"after-sha","before":"before-sha"}`)}
+	event := githubEvent{ID: "push-record", Type: "PushEvent", CreatedAt: created.Add(-time.Minute), Actor: runActor{ID: 123, Login: "actor"}, Payload: json.RawMessage(`{"repository_id":1,"push_id":2,"ref":"refs/heads/main","head":"after-sha","before":"before-sha"}`)}
 	client := testClient(map[string][]byte{
-		runPath("owner/repo", 42):          marshalTestJSON(t, run),
-		runArtifactsPath("owner/repo", 42): []byte(`{"artifacts":[]}`),
-		repoEventsPath("owner/repo", 1):    marshalTestJSON(t, []githubEvent{event}),
+		runPath("owner/repo", 42):                            marshalTestJSON(t, run),
+		runArtifactsPath("owner/repo", 42):                   []byte(`{"artifacts":[]}`),
+		repoEventsPath("owner/repo", 1):                      marshalTestJSON(t, []githubEvent{event}),
+		repositoryPath("owner/repo"):                         []byte(`{"id":99,"name":"repo","full_name":"owner/repo"}`),
+		comparePath("owner/repo", "before-sha", "after-sha"): []byte(`{"status":"ahead","html_url":"https://github.com/owner/repo/compare/before-sha...after-sha","total_commits":1,"commits":[{"sha":"after-sha","html_url":"https://github.com/owner/repo/commit/after-sha","commit":{"author":{"name":"A","email":"a@example.com","date":"2026-11-15T12:00:00Z"},"committer":{"name":"A","email":"a@example.com","date":"2026-11-15T12:00:00Z"},"message":"change","tree":{"sha":"tree-sha"}}}]}`),
 	})
 	var stderr bytes.Buffer
 	result, err := (service{client: client, stderr: &stderr, explain: true}).fetch(42, selector{eventType: "push"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var payload map[string]string
+	var payload map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(result), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["ref"] != "refs/heads/main" || payload["before"] != "before-sha" || payload["after"] != "after-sha" {
+	var values map[string]any
+	if err := json.Unmarshal([]byte(result), &values); err != nil {
+		t.Fatal(err)
+	}
+	if string(payload["ref"]) != `"refs/heads/main"` || string(payload["before"]) != `"before-sha"` || string(payload["after"]) != `"after-sha"` {
 		t.Fatalf("unexpected historical push payload: %s", result)
 	}
-	if strings.Contains(result, "push_id") || !strings.Contains(stderr.String(), "Historical") || !strings.Contains(stderr.String(), "commits and full webhook context are unavailable") {
+	if strings.Contains(result, "push_id") || values["repository"] == nil || values["sender"] == nil || values["commits"] == nil || values["head_commit"] == nil || values["compare"] == nil || values["forced"] != false {
+		t.Fatalf("expected webhook-shaped enriched payload, got %s", result)
+	}
+	if !strings.Contains(stderr.String(), "Historical + Current") || !strings.Contains(stderr.String(), "Events API record provides ref, before, and after SHA only") || !strings.Contains(stderr.String(), "pusher.email and commit distinct flags cannot be recovered") {
 		t.Fatalf("expected translated payload and provenance warning, result=%s stderr=%s", result, stderr.String())
 	}
 }
@@ -564,7 +577,7 @@ func TestFetchReconstructsSparsePushFromRunMetadata(t *testing.T) {
 		repoEventsPath("owner/repo", 1):    []byte(`[]`),
 	})
 	var stderr bytes.Buffer
-	result, err := (service{client: client, stderr: &stderr, explain: true}).fetch(42, selector{eventType: "push"})
+	result, err := (service{client: client, stderr: &stderr, explain: true, skipMissing: true}).fetch(42, selector{eventType: "push"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -583,24 +596,52 @@ func TestFetchReconstructsSparsePushFromRunMetadata(t *testing.T) {
 	}
 }
 
+func TestFetchDoesNotInventPushCreationStateWithoutBeforeSHA(t *testing.T) {
+	run := workflowRun{ID: 42, Event: "push", Status: "completed", HeadSHA: "after-sha", HeadBranch: "main"}
+	client := testClient(map[string][]byte{
+		runPath("owner/repo", 42):          marshalTestJSON(t, run),
+		runArtifactsPath("owner/repo", 42): []byte(`{"artifacts":[]}`),
+		repoEventsPath("owner/repo", 1):    []byte(`[]`),
+	})
+	var stderr bytes.Buffer
+	result, err := (service{client: client, stderr: &stderr}).fetch(42, selector{eventType: "push"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(result), &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"created", "compare", "commits", "head_commit"} {
+		if _, ok := payload[key]; ok {
+			t.Errorf("invented %s without a known before SHA: %s", key, result)
+		}
+	}
+	if string(payload["deleted"]) != "false" {
+		t.Fatalf("expected deleted=false from the known after SHA, got %s", result)
+	}
+}
+
 func TestFetchInfersPushBeforeFromHeadCommitParentWithWarning(t *testing.T) {
 	run := workflowRun{ID: 42, Event: "push", Status: "completed", HeadSHA: "after-sha", HeadBranch: "main"}
 	client := testClient(map[string][]byte{
-		runPath("owner/repo", 42):             marshalTestJSON(t, run),
-		runArtifactsPath("owner/repo", 42):    []byte(`{"artifacts":[]}`),
-		repoEventsPath("owner/repo", 1):       []byte(`[]`),
-		commitPath("owner/repo", "after-sha"): []byte(`{"sha":"after-sha","parents":[{"sha":"likely-before"}]}`),
+		runPath("owner/repo", 42):                               marshalTestJSON(t, run),
+		runArtifactsPath("owner/repo", 42):                      []byte(`{"artifacts":[]}`),
+		repoEventsPath("owner/repo", 1):                         []byte(`[]`),
+		commitPath("owner/repo", "after-sha"):                   []byte(`{"sha":"after-sha","parents":[{"sha":"likely-before"}]}`),
+		repositoryPath("owner/repo"):                            []byte(`{"id":99,"name":"repo","full_name":"owner/repo"}`),
+		comparePath("owner/repo", "likely-before", "after-sha"): []byte(`{"status":"ahead","html_url":"https://github.com/owner/repo/compare/likely-before...after-sha","total_commits":1,"commits":[{"sha":"after-sha","html_url":"https://github.com/owner/repo/commit/after-sha","commit":{"author":{"name":"A","email":"a@example.com","date":"2026-11-15T12:00:00Z"},"committer":{"name":"A","email":"a@example.com","date":"2026-11-15T12:00:00Z"},"message":"change","tree":{"sha":"tree-sha"}}}]}`),
 	})
 	var stderr bytes.Buffer
 	result, err := (service{client: client, stderr: &stderr, explain: true}).fetch(42, selector{eventType: "push"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var payload map[string]string
+	var payload map[string]any
 	if err := json.Unmarshal([]byte(result), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["before"] != "likely-before" || payload["after"] != "after-sha" {
+	if payload["before"] != "likely-before" || payload["after"] != "after-sha" || payload["commits"] == nil || payload["repository"] == nil {
 		t.Fatalf("expected first parent as inferred before: %s", result)
 	}
 	if !strings.Contains(stderr.String(), "inferred before from the first parent") || !strings.Contains(stderr.String(), "may be wrong when multiple commits") || !strings.Contains(stderr.String(), "before <- first parent") {
@@ -738,7 +779,7 @@ func makePRTestEvent(id string, created time.Time, action string, number int64, 
 	if err != nil {
 		panic(err)
 	}
-	return githubEvent{ID: id, Type: "PullRequestEvent", CreatedAt: created, Actor: runActor{Login: "actor"}, Payload: payload}
+	return githubEvent{ID: id, Type: "PullRequestEvent", CreatedAt: created, Actor: runActor{ID: 123, Login: "actor"}, Payload: payload}
 }
 
 func TestEventPayloadValidationRejectsMissingFields(t *testing.T) {
@@ -773,10 +814,11 @@ func TestFetchUsesEventPayloadAndFetchMissingOnlyAddsAbsentFields(t *testing.T) 
 		runArtifactsPath("owner/repo", 42): []byte(`{"artifacts":[]}`),
 		repoEventsPath("owner/repo", 1):    marshalTestJSON(t, []githubEvent{event}),
 		pullRequestPath("owner/repo", 7):   currentPR,
+		repositoryPath("owner/repo"):       []byte(`{"id":99,"name":"repo","full_name":"owner/repo"}`),
 	}
 	client := testClient(responses)
 	var stderr bytes.Buffer
-	result, err := (service{client: client, stderr: &stderr, fetchMissing: true, explain: true}).fetch(42, selector{eventType: "pull_request", action: "opened"})
+	result, err := (service{client: client, stderr: &stderr, explain: true}).fetch(42, selector{eventType: "pull_request", action: "opened"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -791,10 +833,14 @@ func TestFetchUsesEventPayloadAndFetchMissingOnlyAddsAbsentFields(t *testing.T) 
 	if decoded.Action != "opened" || decoded.Number != 7 || decoded.PullRequest["title"] != "event-record-title" || decoded.PullRequest["body"] != "current-body" {
 		t.Fatalf("unexpected merged event: %#v", decoded)
 	}
-	if strings.Contains(result, `"repository"`) || strings.Contains(result, `"actor"`) {
-		t.Fatalf("Events API envelope leaked into event payload: %s", result)
+	var topLevel map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(result), &topLevel); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(stderr.String(), "pull_request.body") || !strings.Contains(stderr.String(), "embedded PR object") {
+	if topLevel["repository"] == nil || topLevel["sender"] == nil || topLevel["actor"] != nil {
+		t.Fatalf("missing webhook-shaped repository/sender fields or leaked actor envelope: %s", result)
+	}
+	if !strings.Contains(stderr.String(), "pull_request.body") || !strings.Contains(stderr.String(), "repository") || !strings.Contains(stderr.String(), "current PR state") {
 		t.Fatalf("explain output lacks provenance: %s", stderr.String())
 	}
 }
@@ -806,7 +852,7 @@ func TestFetchArtifactsRemainUntouchedByFetchMissingFields(t *testing.T) {
 		runArtifactsPath("owner/repo", 42):   marshalTestJSON(t, artifactList{Artifacts: []artifact{{ID: 1, Name: "event.json"}}}),
 		artifactArchivePath("owner/repo", 1): makeArchive(t, archiveEntry{name: "event.json", content: string(payload)}),
 	})
-	result, err := (service{client: client, stderr: &bytes.Buffer{}, fetchMissing: true}).fetch(42, selector{eventType: "pull_request", action: "opened"})
+	result, err := (service{client: client, stderr: &bytes.Buffer{}}).fetch(42, selector{eventType: "pull_request", action: "opened"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -836,12 +882,72 @@ func TestFetchSkipArtifactUsesEventsAPI(t *testing.T) {
 		}
 	}}
 	var stderr bytes.Buffer
-	result, err := (service{client: client, stderr: &stderr, skipArtifact: true}).fetch(42, selector{eventType: "pull_request", action: "opened"})
+	result, err := (service{client: client, stderr: &stderr, skipArtifact: true, skipMissing: true}).fetch(42, selector{eventType: "pull_request", action: "opened"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(stderr.String(), "Events API record event-1") || !strings.Contains(result, `"action": "opened"`) {
 		t.Fatalf("expected Events API payload, got result=%s stderr=%s", result, stderr.String())
+	}
+}
+
+func TestFetchSkipAPIStateLeavesHistoricalEventsPayloadUnchanged(t *testing.T) {
+	created := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	run := workflowRun{Event: "pull_request", Status: "completed", CreatedAt: created, PullRequests: []runPullRef{{Number: 7}}}
+	event := makePRTestEvent("event-1", created.Add(-time.Minute), "opened", 7, "head")
+	client := ghClient{repo: "owner/repo", apiFunc: func(path string, _ int) ([]byte, error) {
+		switch path {
+		case runPath("owner/repo", 42):
+			return marshalTestJSON(t, run), nil
+		case runArtifactsPath("owner/repo", 42):
+			return []byte(`{"artifacts":[]}`), nil
+		case repoEventsPath("owner/repo", 1):
+			return marshalTestJSON(t, []githubEvent{event}), nil
+		default:
+			return nil, fmt.Errorf("API state lookup should have been skipped: %s", path)
+		}
+	}}
+	var stderr bytes.Buffer
+	result, err := (service{client: client, stderr: &stderr, skipAPI: true}).fetch(42, selector{eventType: "pull_request", action: "opened"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got, want map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(result), &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(event.Payload, &want); err != nil {
+		t.Fatal(err)
+	}
+	gotJSON, _ := json.Marshal(got)
+	wantJSON, _ := json.Marshal(want)
+	if !bytes.Equal(gotJSON, wantJSON) {
+		t.Fatalf("expected unaugmented historical payload %s, got %s", event.Payload, result)
+	}
+}
+
+func TestFetchHistoricalPushSkipMissingFieldsAvoidsAPIEnrichment(t *testing.T) {
+	created := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	run := workflowRun{Event: "push", Status: "completed", CreatedAt: created, HeadSHA: "after-sha", HeadBranch: "main"}
+	event := githubEvent{ID: "push-record", Type: "PushEvent", CreatedAt: created.Add(-time.Minute), Payload: json.RawMessage(`{"ref":"refs/heads/main","head":"after-sha","before":"before-sha"}`)}
+	client := ghClient{repo: "owner/repo", apiFunc: func(path string, _ int) ([]byte, error) {
+		switch path {
+		case runPath("owner/repo", 42):
+			return marshalTestJSON(t, run), nil
+		case runArtifactsPath("owner/repo", 42):
+			return []byte(`{"artifacts":[]}`), nil
+		case repoEventsPath("owner/repo", 1):
+			return marshalTestJSON(t, []githubEvent{event}), nil
+		default:
+			return nil, fmt.Errorf("API enrichment should have been skipped: %s", path)
+		}
+	}}
+	result, err := (service{client: client, stderr: &bytes.Buffer{}, skipMissing: true}).fetch(42, selector{eventType: "push"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "{\n  \"after\": \"after-sha\",\n  \"before\": \"before-sha\",\n  \"ref\": \"refs/heads/main\"\n}" {
+		t.Fatalf("expected slim translated payload with no enrichment, got %s", result)
 	}
 }
 

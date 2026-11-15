@@ -21,7 +21,7 @@ The `--event` selector is required:
 gh fetch-event 123456789 --event pull_request.opened --output event.json
 gh fetch-event 123456789 --event pull_request.synchronize --explain
 gh fetch-event 123456789 --event pull_request.labelled=bug
-gh fetch-event 123456789 --event pull_request.labelled=bug --fetch-missing-fields
+gh fetch-event 123456789 --event pull_request.labelled=bug --skip-missing-fields
 gh fetch-event 123456789 --event pull_request.opened --repo OWNER/REPO
 gh fetch-event 123456789 --event push --explain > event.json
 act push -e event.json
@@ -32,10 +32,12 @@ act push -e event.json
 The following steps are followed in order. If any step is successful, searching stops.
 
 1. Looks for a run artifact named `debug-logs` or `event.json` and reads one matching event payload file from it. It accepts `event.json` and the event-specific filename produced by [mheap/debug-artifact](https://github.com/mheap/debug-artifact).
-2. Search the repository Events API feed for a unique record matching the run metadata. This is only possible for events that occurred in the last six hours. The `--fetch-missing-fields` option fetches live data and populates missing fields in these events.
+2. Search the repository Events API feed for a unique record matching the run metadata. This is only possible for events that occurred in the last six hours. Missing pull request fields are filled by default from current PR/repository data and the Events API actor. Push events are converted to webhook field names and augmented with repository and commit comparison data when available. Fields already present in the event are preserved. Use `--skip-missing-fields` to return the event record without this enrichment or inferred push details.
     1. Pull requests are matched by action and PR number
     2. Pushes are matched using the SHA and branch/ref, plus event time
 3. The event is reconstructed using data from the APIs. The data may have changed since the run when using this strategy.
+
+Push reconstruction uses the workflow run's head SHA and branch. It may infer `before` from the head commit's first parent, which can be wrong for multi-commit pushes or rewritten history. When both SHAs are available, commit details come from the compare API; `distinct`, the pusher email, and some historical values are not recoverable. The pusher name and sender may be inferred from the run actor, which can differ after a rerun.
 
 ## Source controls
 

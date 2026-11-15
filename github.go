@@ -145,8 +145,16 @@ func pullRequestPath(repo string, number int64) string {
 	return "/repos/" + repo + "/pulls/" + fmt.Sprint(number)
 }
 
+func repositoryPath(repo string) string {
+	return "/repos/" + repo
+}
+
 func commitPath(repo, sha string) string {
 	return "/repos/" + repo + "/commits/" + url.PathEscape(sha)
+}
+
+func comparePath(repo, base, head string) string {
+	return "/repos/" + repo + "/compare/" + url.PathEscape(base) + "..." + url.PathEscape(head)
 }
 
 func commitPullsPath(repo, sha string) string {
