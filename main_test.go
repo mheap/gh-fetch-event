@@ -217,6 +217,27 @@ func TestEventFileFromRawJSON(t *testing.T) {
 	}
 }
 
+func TestEventFileFromDebugArtifactActionFilename(t *testing.T) {
+	const content = `{"action":"labeled","number":1,"label":{"name":"bug"},"pull_request":{}}`
+	archive := makeArchive(t, archiveEntry{name: "debug-artifact/pull_request-labeled.json", content: content}, archiveEntry{name: "debug-artifact/env", content: "GITHUB_TOKEN=redacted"})
+	got, err := eventFileFromArchive(archive, selector{eventType: "pull_request", action: "labeled", label: "bug"})
+	if err != nil || string(got) != content {
+		t.Fatalf("eventFileFromArchive = (%s, %v), want selected event file", got, err)
+	}
+}
+
+func TestEnvEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{{"true", true}, {"TRUE", true}, {"1", true}, {"false", false}, {"", false}, {"sometimes", false}} {
+		t.Setenv("GH_FETCH_EVENT_TEST_BOOL", tc.value)
+		if got := envEnabled("GH_FETCH_EVENT_TEST_BOOL"); got != tc.want {
+			t.Errorf("envEnabled(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
 func TestEventFileFromArchiveRejectsMissingOrMultipleFiles(t *testing.T) {
 	for _, files := range [][]archiveEntry{{{name: "logs.txt", content: "no event"}}, {{name: "event.json", content: "{}"}, {name: "nested/event.json", content: "{}"}}} {
 		archive := makeArchive(t, files...)
@@ -795,6 +816,56 @@ func TestFetchArtifactsRemainUntouchedByFetchMissingFields(t *testing.T) {
 	}
 	if _, exists := decoded["repository"]; exists {
 		t.Fatalf("artifact payload was changed: %s", result)
+	}
+}
+
+func TestFetchSkipArtifactUsesEventsAPI(t *testing.T) {
+	created := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	run := workflowRun{Event: "pull_request", Status: "completed", CreatedAt: created, PullRequests: []runPullRef{{Number: 7}}}
+	event := makePRTestEvent("event-1", created.Add(-time.Minute), "opened", 7, "head")
+	client := ghClient{repo: "owner/repo", apiFunc: func(path string, _ int) ([]byte, error) {
+		switch path {
+		case runPath("owner/repo", 42):
+			return marshalTestJSON(t, run), nil
+		case repoEventsPath("owner/repo", 1):
+			return marshalTestJSON(t, []githubEvent{event}), nil
+		case runArtifactsPath("owner/repo", 42):
+			return nil, errors.New("artifact lookup should have been skipped")
+		default:
+			return nil, fmt.Errorf("unexpected API call %s", path)
+		}
+	}}
+	var stderr bytes.Buffer
+	result, err := (service{client: client, stderr: &stderr, skipArtifact: true}).fetch(42, selector{eventType: "pull_request", action: "opened"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "Events API record event-1") || !strings.Contains(result, `"action": "opened"`) {
+		t.Fatalf("expected Events API payload, got result=%s stderr=%s", result, stderr.String())
+	}
+}
+
+func TestFetchSkipEventAndAPIStateFailsWithoutCallingEventFeed(t *testing.T) {
+	calledEvents := false
+	client := ghClient{repo: "owner/repo", apiFunc: func(path string, _ int) ([]byte, error) {
+		switch path {
+		case runPath("owner/repo", 42):
+			return []byte(`{"event":"pull_request","status":"completed"}`), nil
+		case runArtifactsPath("owner/repo", 42):
+			return []byte(`{"artifacts":[]}`), nil
+		case repoEventsPath("owner/repo", 1):
+			calledEvents = true
+			return []byte(`[]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected API call %s", path)
+		}
+	}}
+	_, err := (service{client: client, stderr: &bytes.Buffer{}, skipEvent: true, skipAPI: true}).fetch(42, selector{eventType: "pull_request", action: "opened"})
+	if err == nil || !strings.Contains(err.Error(), "GH_FETCH_EVENT_SKIP_API") {
+		t.Fatalf("got error %v, wanted disabled API reconstruction error", err)
+	}
+	if calledEvents {
+		t.Fatal("repository Events API was called despite skipEvent")
 	}
 }
 

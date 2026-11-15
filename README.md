@@ -31,11 +31,19 @@ act push -e event.json
 
 The following steps are followed in order. If any step is successful, searching stops.
 
-1. Looks for a run artifact named `debug-logs` or `event.json` and reads one `event.json` file from it. (See [mheap/debug-artifact](https://github.com/mheap/debug-artifact) for an action that creates this file)
+1. Looks for a run artifact named `debug-logs` or `event.json` and reads one matching event payload file from it. It accepts `event.json` and the event-specific filename produced by [mheap/debug-artifact](https://github.com/mheap/debug-artifact).
 2. Search the repository Events API feed for a unique record matching the run metadata. This is only possible for events that occurred in the last six hours. The `--fetch-missing-fields` option fetches live data and populates missing fields in these events.
     1. Pull requests are matched by action and PR number
     2. Pushes are matched using the SHA and branch/ref, plus event time
 3. The event is reconstructed using data from the APIs. The data may have changed since the run when using this strategy.
+
+## Source controls
+
+These environment variables are useful for comparing retrieval sources:
+
+- `GH_FETCH_EVENT_SKIP_ARTIFACT=true` skips run artifact lookup.
+- `GH_FETCH_EVENT_SKIP_EVENT=true` skips the repository Events API feed.
+- `GH_FETCH_EVENT_SKIP_API=true` disables current-state reconstruction when no artifact or matching Events API record is available. Run metadata and source lookup APIs are still used.
 
 ## Install and build
 

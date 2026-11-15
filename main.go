@@ -46,7 +46,15 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if err := client.resolveContext(); err != nil {
 		return err
 	}
-	service := service{client: client, stderr: stderr, explain: opts.explain, fetchMissing: opts.fetchMissing}
+	service := service{
+		client:       client,
+		stderr:       stderr,
+		explain:      opts.explain,
+		fetchMissing: opts.fetchMissing,
+		skipArtifact: envEnabled("GH_FETCH_EVENT_SKIP_ARTIFACT"),
+		skipEvent:    envEnabled("GH_FETCH_EVENT_SKIP_EVENT"),
+		skipAPI:      envEnabled("GH_FETCH_EVENT_SKIP_API"),
+	}
 	payload, err := service.fetch(opts.runID, selector)
 	if err != nil {
 		return err
@@ -60,6 +68,11 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("write output file: %w", err)
 	}
 	return nil
+}
+
+func envEnabled(name string) bool {
+	value, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(name)))
+	return err == nil && value
 }
 
 func parseOptions(args []string, stderr io.Writer) (options, bool, error) {

@@ -22,6 +22,9 @@ type service struct {
 	stderr       io.Writer
 	explain      bool
 	fetchMissing bool
+	skipArtifact bool
+	skipEvent    bool
+	skipAPI      bool
 }
 
 type workflowRun struct {
@@ -90,21 +93,27 @@ func (s service) fetch(runID int64, selected selector) (string, error) {
 		return "", fmt.Errorf("selector %q does not match run event %q", selected.eventType+"."+selected.action, run.Event)
 	}
 
-	if raw, found, err := s.findArtifact(runID, selected); err != nil {
-		return "", err
-	} else if found {
-		return prettyJSON(raw)
+	if !s.skipArtifact {
+		if raw, found, err := s.findArtifact(runID, selected); err != nil {
+			return "", err
+		} else if found {
+			return prettyJSON(raw)
+		}
 	}
 
-	events, eventErr := s.listEvents()
-	if eventErr != nil {
-		fmt.Fprintf(s.stderr, "Warning: could not inspect repository events: %v\n", eventErr)
+	var events []githubEvent
+	eventState := "none"
+	if !s.skipEvent {
+		var eventErr error
+		events, eventErr = s.listEvents()
+		if eventErr != nil {
+			fmt.Fprintf(s.stderr, "Warning: could not inspect repository events: %v\n", eventErr)
+		}
 	}
 	var matched *githubEvent
-	var eventState string
-	if selected.eventType == "push" {
+	if !s.skipEvent && selected.eventType == "push" {
 		matched, eventState = matchPushEvent(events, run)
-	} else {
+	} else if !s.skipEvent {
 		matched, eventState = matchEvent(events, run, selected)
 	}
 	if matched != nil {
@@ -152,7 +161,13 @@ func (s service) fetch(runID int64, selected selector) (string, error) {
 		return prettyJSON(result)
 	}
 	if selected.eventType == "push" {
+		if s.skipAPI {
+			return "", errors.New("no artifact or matching event record was found; API-state reconstruction is disabled by GH_FETCH_EVENT_SKIP_API")
+		}
 		return s.reconstructPush(run, eventState)
+	}
+	if s.skipAPI {
+		return "", errors.New("no artifact or matching event record was found; API-state reconstruction is disabled by GH_FETCH_EVENT_SKIP_API")
 	}
 
 	prNumber, err := s.resolvePullRequest(run, events)
@@ -219,7 +234,7 @@ func (s service) findArtifact(runID int64, selected selector) ([]byte, bool, err
 	if err != nil {
 		return nil, false, fmt.Errorf("download recognized artifact %q: %w", candidates[0].Name, err)
 	}
-	eventJSON, err := eventFileFromArchive(archive)
+	eventJSON, err := eventFileFromArchive(archive, selected)
 	if err != nil {
 		return nil, false, fmt.Errorf("read event payload from artifact %q: %w", candidates[0].Name, err)
 	}
@@ -230,7 +245,7 @@ func (s service) findArtifact(runID int64, selected selector) ([]byte, bool, err
 	return eventJSON, true, nil
 }
 
-func eventFileFromArchive(data []byte) ([]byte, error) {
+func eventFileFromArchive(data []byte, selectors ...selector) ([]byte, error) {
 	if json.Valid(data) {
 		return data, nil
 	}
@@ -238,9 +253,18 @@ func eventFileFromArchive(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("artifact is not a ZIP archive or raw event JSON")
 	}
-	var matches [][]byte
+	var exactMatches, selectedMatches [][]byte
+	expectedName := ""
+	if len(selectors) > 0 {
+		expectedName = debugArtifactEventFilename(selectors[0])
+	}
 	for _, file := range reader.File {
-		if file.FileInfo().IsDir() || file.Name != "event.json" && !strings.HasSuffix(file.Name, "/event.json") {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		isExact := file.Name == "event.json" || strings.HasSuffix(file.Name, "/event.json")
+		isSelected := expectedName != "" && (file.Name == expectedName || strings.HasSuffix(file.Name, "/"+expectedName))
+		if !isExact && !isSelected {
 			continue
 		}
 		if file.UncompressedSize64 > maxEventJSON {
@@ -261,15 +285,33 @@ func eventFileFromArchive(data []byte) ([]byte, error) {
 		if len(content) > maxEventJSON {
 			return nil, errors.New("event.json in artifact exceeds the size limit")
 		}
-		matches = append(matches, content)
+		if isExact {
+			exactMatches = append(exactMatches, content)
+		} else {
+			selectedMatches = append(selectedMatches, content)
+		}
+	}
+	matches := exactMatches
+	if len(matches) == 0 {
+		matches = selectedMatches
 	}
 	if len(matches) == 0 {
-		return nil, errors.New("recognized artifact does not contain event.json")
+		return nil, errors.New("recognized artifact does not contain event.json or the selected event payload")
 	}
 	if len(matches) > 1 {
-		return nil, errors.New("artifact contains multiple event.json files")
+		return nil, errors.New("artifact contains multiple matching event payload files")
 	}
 	return matches[0], nil
+}
+
+func debugArtifactEventFilename(selected selector) string {
+	if selected.eventType == "push" {
+		return "push.json"
+	}
+	if selected.eventType == "pull_request" {
+		return "pull_request-" + selected.action + ".json"
+	}
+	return ""
 }
 
 func validateEventPayload(data []byte, selected selector) error {
@@ -598,7 +640,7 @@ func fillMissingPaths(destination, source map[string]json.RawMessage, prefix str
 func (s service) reportArtifact(name string) {
 	fmt.Fprintf(s.stderr, "Source: Original (run artifact %s).\n", name)
 	if s.explain {
-		fmt.Fprintln(s.stderr, "Provenance: all output fields are from the artifact's event.json.")
+		fmt.Fprintln(s.stderr, "Provenance: all output fields are from the event payload captured in the artifact.")
 	}
 }
 
